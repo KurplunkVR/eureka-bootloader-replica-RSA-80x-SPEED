@@ -1,3 +1,7 @@
+# eureka-bootloader-replica
+Eureka bootloader replica for attempting to find an exploit
+
+
 # Quest Unlock Tool (Verifier + Attacker)
 
 This project emulates the Meta Quest bootloader’s CheckToken() logic
@@ -17,3 +21,4 @@ and provides an attacker harness to test bypass strategies.
 
 5. Run attacker fuzz harness:
    python attacker.py
+

@@ -1,288 +1,261 @@
-# Fuzz Attack.py — GUI-first, low-lag multithreaded mutation fuzzer
-
-import os, random, time, threading, queue
+# Filename: fuzz_main.py
+import threading
+import os, random, time, hashlib, struct
+import queue
 from datetime import datetime
 from pathlib import Path
 import tkinter as tk
 from tkinter import scrolledtext, messagebox
+
 import verifier
-from verifier import CheckToken
+from verifier import CheckToken, gEfiMiscPartitionGuid
+
 
 # ======= CONFIG =======
 BASE_TOKEN_PATH = "token_base.bin"
-OUTPUT_DIR = "fuzz_results"
-THREAD_COUNT = max(1, (os.cpu_count() or 4) - 1)
-MUTATION_COUNT = 50                 # per token (byte XORs)
-GUI_REFRESH_MS = 200                # UI tick
-LOG_LEVELS_SHOW = {"ERROR","ANOMALY","BYPASS"}  # drop INFO to avoid spam
-LOG_MAX_LINES = 1200                # keep last N lines in GUI
-LOG_BATCH_GUI = 300                 # max lines to pull into GUI per tick
-LOG_MAX_RATE = 400                  # lines/sec forwarded from raw->UI
-STATS_FLUSH_EVERY = 64              # worker updates stats every N iters
+DEFAULT_THREAD_COUNT = 5
+GUI_REFRESH_MS = 100
+LOG_MAX_LINES = 500
+LOG_BATCH_GUI = 50
 # ======================
 
-# Shared state
-stop_event = threading.Event()
-stats = {}                   # wid -> {"count": int, "status": str}
-threads = []
+log_queue = queue.Queue(maxsize=10000)
+stats_lock = threading.Lock()
+stats = {}
 mutations_done = 0
-mutations_lock = threading.Lock()
+stop_event = threading.Event()
+seen_hashes = set()
 
-# Queues: raw (from verifier) -> filtered UI
-raw_log_q: "queue.Queue[tuple[str,str]]" = queue.Queue(maxsize=10000)
-ui_log_q:  "queue.Queue[tuple[str,str]]" = queue.Queue(maxsize=10000)
-verifier.external_logger = raw_log_q  # hook verifier logs
-
-# Ensure paths & seed
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+verifier.external_logger = log_queue
 BASE_TOKEN = Path(BASE_TOKEN_PATH).read_bytes()
 if not BASE_TOKEN:
     raise ValueError("Base token is empty")
 
+def build_token(serial: bytes, records: list, sig_size=256):
+    payload = bytearray()
+    payload += struct.pack("<I", len(serial))
+    payload += serial
+    payload += gEfiMiscPartitionGuid
 
-# ---------- Logging pipeline ----------
-def log_proxy_thread():
-    """Filter & rate-limit logs from verifier to UI queue."""
-    allow_all = (LOG_LEVELS_SHOW == {"ALL"})
-    last_sec = int(time.time())
-    sent_this_sec = 0
-    dropped = 0
+    for rec in records:
+        rec_type, data = rec
+        payload.append(rec_type)
+        payload += data
 
-    while not stop_event.is_set():
-        try:
-            level, msg = raw_log_q.get(timeout=0.2)
-        except queue.Empty:
-            # once a second, emit dropped summary
-            now = int(time.time())
-            if now != last_sec:
-                if dropped:
-                    try:
-                        ui_log_q.put_nowait(("INFO", f"(dropped {dropped} verbose log lines)"))
-                    except queue.Full:
-                        pass
-                    dropped = 0
-                sent_this_sec = 0
-                last_sec = now
-            continue
+    fake_sig = os.urandom(sig_size)  # garbage, assume glitch bypass
+    return fake_sig + payload
 
-        # filter
-        if not allow_all and level not in LOG_LEVELS_SHOW:
-            dropped += 1
-            continue
+def mutate_structured(serial: bytes, records: list):
+    choice = random.choice([
+        "hdrlen_offby1", "serial_null", "guid_flip",
+        "add_unlock", "add_rollback"
+    ])
 
-        # rate limit
-        now = int(time.time())
-        if now != last_sec:
-            if dropped:
-                try:
-                    ui_log_q.put_nowait(("INFO", f"(dropped {dropped} verbose log lines)"))
-                except queue.Full:
-                    pass
-                dropped = 0
-            sent_this_sec = 0
-            last_sec = now
+    if choice == "hdrlen_offby1":
+        serial = serial + b"A"
+    elif choice == "serial_null":
+        serial = serial[:len(serial)//2] + b"\x00" + serial[len(serial)//2:]
+    elif choice == "guid_flip":
+        records.insert(0, (0xFF, os.urandom(4)))
+    elif choice == "add_unlock":
+        records.append((2, b"\x01"))  # unlock=1
+    elif choice == "add_rollback":
+        records.append((3, b"\x00"))
 
-        if sent_this_sec >= LOG_MAX_RATE:
-            dropped += 1
-            continue
-
-        try:
-            ui_log_q.put_nowait((level, msg))
-            sent_this_sec += 1
-        except queue.Full:
-            dropped += 1
+    return build_token(serial, records)
 
 
-def console_mirror_thread():
-    """Optional: mirror significant UI logs to console only."""
-    while not stop_event.is_set():
-        try:
-            level, msg = ui_log_q.get(timeout=0.2)
-            # put back for GUI to read too
-            try:
-                ui_log_q.put_nowait((level, msg))
-            except queue.Full:
-                pass
-            if level in {"ERROR","ANOMALY","BYPASS"}:
-                print(f"[{level}] {msg}")
-        except queue.Empty:
-            continue
 
-
-# ---------- Mutations ----------
-def mutate_token(base: bytes) -> bytes:
-    t = bytearray(base)
-    # XOR random bytes
-    for _ in range(random.randint(1, MUTATION_COUNT)):
-        idx = random.randrange(len(t))
-        t[idx] ^= random.randint(1, 255)
-    # occasional insert/delete for structure perturbation
-    r = random.random()
-    if r < 0.08 and len(t) > 1:
-        del t[random.randrange(len(t))]
-    elif r < 0.16:
-        t.insert(random.randrange(len(t)+1), random.randrange(256))
-    return bytes(t)
+def mutate_token(base_serial: bytes, sig_size=256):
+    records = []
+    return mutate_structured(base_serial, records)
 
 
 # ---------- Worker ----------
-def fuzz_worker(wid: int):
+def worker_thread(wid: int):
     global mutations_done
-    count = 0
     stats[wid] = {"count": 0, "status": "START"}
 
     while not stop_event.is_set():
-        mutated = mutate_token(BASE_TOKEN)
+        tok = mutate_token(BASE_TOKEN)
+        digest = hashlib.sha256(tok).digest()
+        if digest in seen_hashes:
+            continue
+        seen_hashes.add(digest)
+
         try:
-            result = CheckToken(mutated)
+            result = CheckToken(tok)
         except Exception as e:
-            fname = os.path.join(OUTPUT_DIR, f"exception_{wid}_{int(time.time())}.bin")
-            Path(fname).write_bytes(mutated)
-            stats[wid] = {"count": count, "status": f"EXC {e}"}
-            try: ui_log_q.put_nowait(("ERROR", f"Worker {wid} exception: {e} -> {fname}"))
-            except queue.Full: pass
+            log_queue.put(("ERROR", f"Worker {wid} EXC {repr(e)}"))
+            with stats_lock:
+                stats[wid]["status"] = "EXC"
             stop_event.set()
             break
 
-        count += 1
-        if (count % STATS_FLUSH_EVERY) == 0:
-            stats[wid] = {"count": count, "status": "OK"}
-        if (count & 0xFF) == 0:
-            with mutations_lock:
-                mutations_done += 256  # amortize
+        with stats_lock:
+            stats[wid]["count"] += 1
+            stats[wid]["status"] = "OK"
+        mutations_done += 1
 
         if result == 0:
-            fname = os.path.join(OUTPUT_DIR, f"bypass_{wid}_{int(time.time())}.bin")
-            Path(fname).write_bytes(mutated)
-            stats[wid] = {"count": count, "status": "BYPASS!"}
-            try: ui_log_q.put_nowait(("BYPASS", f"Worker {wid} FOUND BYPASS -> {fname}"))
-            except queue.Full: pass
+            log_queue.put(("BYPASS", f"Worker {wid} BYPASS"))
+            with stats_lock:
+                stats[wid]["status"] = "BYPASS"
             stop_event.set()
             break
         elif result != 0x8000000000000015:
-            fname = os.path.join(OUTPUT_DIR, f"anomaly_{wid}_{int(time.time())}_{hex(result)}.bin")
-            Path(fname).write_bytes(mutated)
-            stats[wid] = {"count": count, "status": f"ANOMALY {hex(result)}"}
-            try: ui_log_q.put_nowait(("ANOMALY", f"Worker {wid} anomaly {hex(result)} -> {fname}"))
-            except queue.Full: pass
-
-    if "status" not in stats.get(wid, {}):
-        stats[wid] = {"count": count, "status": "DONE"}
-
+            log_queue.put(("ANOMALY", f"Worker {wid} anomaly {hex(result)}"))
 
 # ---------- GUI ----------
 class FuzzGUI:
-    def __init__(self, root: tk.Tk):
+    def __init__(self, root):
         self.root = root
-        root.title("Quest Bootloader Token Fuzzer — Low-lag")
+        self.thread_count = DEFAULT_THREAD_COUNT
+        self.worker_threads = []
+        root.title("Quest Token Bootloader Fuzz Attack Emulator")
 
-        # Header
-        top = tk.Frame(root); top.pack(fill="x", padx=8, pady=6)
-        self.stop_btn = tk.Button(top, text="🛑 Stop", command=self.stop_all, bg="red", fg="white")
-        self.stop_btn.pack(side="right")
-        self.total_label = tk.Label(top, text="Total Executions: 0", font=("Consolas", 10, "bold"))
-        self.total_label.pack(side="left")
-        self.rate_label = tk.Label(top, text="Throughput: 0/s")
-        self.rate_label.pack(side="left", padx=12)
+        # Controls
+        top = tk.Frame(root)
+        top.pack(fill="x", padx=8, pady=6)
+        tk.Label(top, text="Threads:").pack(side="left")
+        self.thread_count_var = tk.IntVar(value=DEFAULT_THREAD_COUNT)
+        self.thread_spin = tk.Spinbox(top, from_=1, to=50, width=5, textvariable=self.thread_count_var)
+        self.thread_spin.pack(side="left", padx=5)
 
-        # Thread stats
-        body = tk.Frame(root); body.pack(fill="both", expand=True, padx=8, pady=4)
-        left = tk.Frame(body); left.pack(side="left", anchor="n")
+        self.start_btn = tk.Button(top, text="▶ Start", command=self.start)
+        self.start_btn.pack(side="left", padx=5)
+        self.stop_btn = tk.Button(top, text="🛑 Stop", command=self.stop, state="disabled")
+        self.stop_btn.pack(side="left", padx=5)
+
+        # Log level filter checkboxes
+        self.filter_levels = {
+            "INFO": tk.BooleanVar(value=True),
+            "DEBUG": tk.BooleanVar(value=True),
+            "ERROR": tk.BooleanVar(value=True),
+            "BYPASS": tk.BooleanVar(value=True),
+            "ANOMALY": tk.BooleanVar(value=True),
+        }
+
+        filter_frame = tk.Frame(root)
+        filter_frame.pack(anchor="w", padx=8)
+        tk.Label(filter_frame, text="Show Logs:").pack(side="left")
+        for lvl, var in self.filter_levels.items():
+            cb = tk.Checkbutton(filter_frame, text=lvl, variable=var)
+            cb.pack(side="left", padx=(0, 5))
+
+        # Toggle checkbox for hiding VerifyFinal / Signature errors
+        self.hide_verify_errors_var = tk.BooleanVar(value=True)
+        hide_cb = tk.Checkbutton(root, text="Hide VerifyFinal / InvalidSignature Logs", variable=self.hide_verify_errors_var)
+        hide_cb.pack(anchor="w", padx=8, pady=(0,5))
+
+        self.total_label = tk.Label(root, text="Total Executions: 0")
+        self.total_label.pack(anchor="w", padx=8)
+        self.rate_label = tk.Label(root, text="Throughput: 0/s")
+        self.rate_label.pack(anchor="w", padx=8)
+
+        self.thread_frame = tk.Frame(root)
+        self.thread_frame.pack(side="left", anchor="n", padx=8, pady=4)
         self.labels = {}
-        for i in range(THREAD_COUNT):
-            lbl = tk.Label(left, text=f"Thread {i:02d}: START | 0 cases", anchor="w", width=30)
+
+        self.log_text = scrolledtext.ScrolledText(root, width=80, height=25, state="disabled")
+        self.log_text.pack(fill="both", expand=True, padx=8, pady=4)
+
+        self._last_t = time.perf_counter()
+        self._last_mut_done = mutations_done
+        self.root.after(GUI_REFRESH_MS, self.refresh_ui)
+
+    def start(self):
+        global mutations_done
+        mutations_done = 0
+        self.thread_count = self.thread_count_var.get()
+        stop_event.clear()
+        self.clear_labels()
+
+        with stats_lock:
+            stats.clear()
+            for i in range(self.thread_count):
+                stats[i] = {"count": 0, "status": "START"}
+
+        self.worker_threads = []
+        for i in range(self.thread_count):
+            t = threading.Thread(target=worker_thread, args=(i,), daemon=True)
+            t.start()
+            self.worker_threads.append(t)
+
+        self.start_btn.config(state="disabled")
+        self.stop_btn.config(state="normal")
+
+    def clear_labels(self):
+        for lbl in self.labels.values():
+            lbl.destroy()
+        self.labels.clear()
+        for i in range(self.thread_count):
+            lbl = tk.Label(self.thread_frame, text=f"Thread {i:02d}: --- | 0", anchor="w", width=30)
             lbl.pack(anchor="w")
             self.labels[i] = lbl
 
-        # Logs
-        right = tk.Frame(body); right.pack(side="left", fill="both", expand=True)
-        tk.Label(right, text="Logs (filtered)").pack(anchor="w")
-        self.log_text = scrolledtext.ScrolledText(right, width=100, height=28, state="disabled", font=("Consolas", 10))
-        self.log_text.pack(fill="both", expand=True)
-
-        # Start background after GUI shows
-        root.after(0, self.launch_background)
-
-        # UI loop
-        self._last_mut = 0
-        self._last_t = time.perf_counter()
-        root.after(GUI_REFRESH_MS, self.refresh_ui)
-
-    def launch_background(self):
-        # proxy (filter+rate-limit) and console mirror
-        t1 = threading.Thread(target=log_proxy_thread, daemon=True); t1.start(); threads.append(t1)
-        t2 = threading.Thread(target=console_mirror_thread, daemon=True); t2.start(); threads.append(t2)
-        # workers
-        for wid in range(THREAD_COUNT):
-            stats[wid] = {"count": 0, "status": "START"}
-            t = threading.Thread(target=fuzz_worker, args=(wid,), daemon=True)
-            t.start(); threads.append(t)
-
-    def stop_all(self):
-        self.stop_btn.config(state="disabled")
+    def stop(self):
         stop_event.set()
+        self.stop_btn.config(state="disabled")
+        self.start_btn.config(state="normal")
 
     def _trim_log(self):
         try:
-            lines = int(float(self.log_text.index('end-1c').split('.')[0]))
+            lines = int(self.log_text.index('end-1c').split('.')[0])
             if lines > LOG_MAX_LINES:
-                # remove oldest chunk (keep tail)
                 self.log_text.delete('1.0', f'{lines-LOG_MAX_LINES}.0')
         except Exception:
             pass
 
     def refresh_ui(self):
-        # Stats
         total = 0
-        for wid in range(THREAD_COUNT):
-            st = stats.get(wid, {"count": 0, "status": "-"})
-            total += st["count"]
-            self.labels[wid].config(text=f"Thread {wid:02d}: {st['status']} | {st['count']} cases")
+        with stats_lock:
+            for wid, data in stats.items():
+                total += data["count"]
+                if wid in self.labels:
+                    self.labels[wid].config(text=f"Thread {wid:02d}: {data['status']} | {data['count']}")
+
         self.total_label.config(text=f"Total Executions: {total}")
 
-        # Throughput
         now = time.perf_counter()
-        with mutations_lock:
-            cur = mutations_done
-        dt = max(now - self._last_t, 1e-3)
-        rate = int((cur - self._last_mut) / dt)
+        dt = now - self._last_t if now > self._last_t else 1e-3
+        rate = int((mutations_done - self._last_mut_done) / dt)
         self.rate_label.config(text=f"Throughput: {rate}/s")
         self._last_t = now
-        self._last_mut = cur
+        self._last_mut_done = mutations_done
 
-        # Logs (batched)
-        pulled = 0
-        if ui_log_q.qsize():
+        entries = []
+        try:
+            for _ in range(LOG_BATCH_GUI):
+                level, msg = log_queue.get_nowait()
+
+                if self.hide_verify_errors_var.get():
+                    if "Failed on VerifyFinal" in msg or "Invalid Signature" in msg:
+                        continue
+
+                if self.filter_levels.get(level, tk.BooleanVar(value=False)).get():
+                    ts = datetime.now().strftime("%H:%M:%S")
+                    entries.append(f"[{ts}] [{level}] {msg}")
+        except queue.Empty:
+            pass
+
+        if entries:
             self.log_text.config(state="normal")
-            while pulled < LOG_BATCH_GUI:
-                try:
-                    level, msg = ui_log_q.get_nowait()
-                except queue.Empty:
-                    break
-                ts = datetime.now().strftime("%H:%M:%S")
-                self.log_text.insert(tk.END, f"[{ts}] [{level}] {msg}\n")
-                pulled += 1
+            self.log_text.insert(tk.END, "\n".join(entries) + "\n")
             self._trim_log()
-            self.log_text.config(state="disabled")
             self.log_text.see(tk.END)
+            self.log_text.config(state="disabled")
 
         if not stop_event.is_set():
             self.root.after(GUI_REFRESH_MS, self.refresh_ui)
         else:
-            messagebox.showinfo("Fuzzer", "Fuzzing stopped.")
+            messagebox.showinfo("Stopped", "Fuzzing stopped.")
 
-# ---------- Entrypoint ----------
+# ---------- Main ----------
 def main():
     root = tk.Tk()
     gui = FuzzGUI(root)
-    print(">>> GUI up — starting workers")
-    try:
-        root.mainloop()
-    finally:
-        stop_event.set()
-        for t in threads:
-            t.join(timeout=1.0)
-        print("Fuzz complete. Results in", OUTPUT_DIR)
+    root.mainloop()
 
 if __name__ == "__main__":
     main()
