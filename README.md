@@ -1,24 +1,10 @@
-# eureka-bootloader-replica
-Eureka bootloader replica for attempting to find an exploit
+# eureka-bootloader-replica-RSA-80x-SPEED
 
+the 80x speed version (tested on 8 cores).
+This improves speed by 80 times (on 8 cores)
+WILL ADJUST TO YOUR CORE AMOUNT
 
-# Quest Unlock Tool (Verifier + Attacker)
+key_queue = Queue(maxsize=1024)
+increase the maxsize if you see the size dropping a lot
 
-This project emulates the Meta Quest bootloader’s CheckToken() logic
-and provides an attacker harness to test bypass strategies.
-
-## Usage
-
-1. Install dependencies:
-   pip install cryptography
-
-2. Place your public key into `keys/public.pem`
-
-3. Configure your serial in `config.json`
-
-4. Run verifier directly:
-   python verifier.py
-
-5. Run attacker fuzz harness:
-   python attacker.py
-
+sorry if this repo is bad im new to making public github stuff
