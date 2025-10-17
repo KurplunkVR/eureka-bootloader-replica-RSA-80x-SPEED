@@ -8,3 +8,5 @@ key_queue = Queue(maxsize=1024)
 increase the maxsize if you see the size dropping a lot
 
 sorry if this repo is bad im new to making public github stuff
+
+also I just did this for fun, i was bored
