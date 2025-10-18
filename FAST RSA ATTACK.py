@@ -191,7 +191,7 @@ def main():
     # start key generators (processes)
     gens = []
     for _ in range(max(1, cpu_count() - 2)):
-        p = Process(target=keygen_worker, args=(stop_event, key_queue, 4, 1024))
+        p = Process(target=keygen_worker, args=(stop_event, key_queue, 4, 2048))
         p.daemon = True
         p.start(); gens.append(p)
 
